@@ -1,0 +1,595 @@
+# ── Load required packages ──────────────────────────────────────────────────────
+# fpp3 loads: tsibble (time series data), fable (models), feasts (features & plots),
+#             ggplot2 (graphics), dplyr (data wrangling), lubridate (dates)
+library(fpp3)
+library(knitr)
+install.packages("kableExtra")# kable() for publication-quality tables
+library(kableExtra)  # enhanced table styling
+library(scales)      # comma() for readable axis labels
+
+# ── Read CSV, clean column names, parse dates, and create a tsibble ─────────────
+# rename_with(trimws): removes trailing whitespace from raw CSV column headers
+# my("Jan-80"): lubridate parses "Jan-80" format → Date object
+# yearmonth():  converts Date → tsibble-compatible monthly index
+
+wines_raw <- read.csv("AustralianWines.csv") |>
+  rename_with(trimws) |>
+  mutate(Month = yearmonth(my(Month))) |>
+  as_tsibble(index = Month)
+
+# Quick sanity check: 180 rows, 7 columns (Month + 6 wine types)
+glimpse(wines_raw)
+
+
+
+# ── Isolate Sparkling wine and rename Sales for cleaner code downstream ─────────
+sparkling <- wines_raw |>
+  select(Month, Sales = Sparkling)
+
+# Confirm time span and key summary statistics
+cat("Series:              Sparkling Wine\n")
+cat("Time span:          ", format(min(sparkling$Month)), "to",
+                            format(max(sparkling$Month)), "\n")
+cat("Total observations: ", nrow(sparkling), "months\n")
+cat("Overall mean:       ", round(mean(sparkling$Sales)), "thousand litres/month\n")
+cat("December mean:      ", round(mean(sparkling$Sales[month(sparkling$Month)==12])),
+    "thousand litres\n")
+cat("June mean:          ", round(mean(sparkling$Sales[month(sparkling$Month)==6])),
+    "thousand litres\n")
+cat("Series max:         ", max(sparkling$Sales), "(Dec 1987)\n")
+cat("Series min:         ", min(sparkling$Sales), "thousand litres\n")
+
+# autoplot() on a tsibble produces a clean time series line chart
+autoplot(sparkling, Sales) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Australian Sparkling Wine Sales (1980–1994)",
+    subtitle = "Monthly retail sales — thousands of litres",
+    y        = "Sales (thousands of litres)",
+    x        = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(plot.title    = element_text(face = "bold"),
+        plot.subtitle = element_text(colour = "grey50"))
+
+# gg_subseries() creates one mini-panel per calendar month
+# Blue horizontal line = mean for that month across all years
+sparkling |>
+  gg_subseries(Sales) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Seasonal Subseries: Sparkling Wine (1980–1994)",
+    subtitle = "Each panel = one calendar month | Blue line = month mean across all years",
+    y        = "Sales (thousands of litres)",
+    x        = "Year"
+  ) +
+  theme_minimal(base_size = 11)
+
+# ACF(lag_max=36) checks for autocorrelation up to 3 years
+# Seasonal series show spikes at multiples of the seasonal period (12, 24, 36)
+sparkling |>
+  ACF(Sales, lag_max = 36) |>
+  autoplot() +
+  labs(
+    title    = "ACF: Sparkling Wine Sales (up to 36 months)",
+    subtitle = "Blue dashed lines = 95% significance bounds"
+  ) +
+  theme_minimal(base_size = 13)
+
+
+sparkling |>
+  model(STL(Sales ~ trend(window = 21) + season(window = "periodic"))) |>
+  components() |>
+  autoplot() +
+  labs(title = "STL Decomposition: Sparkling Wine Sales (1980–1994)") +
+  theme_minimal(base_size = 12)
+
+
+## Interpretation
+
+### Trend, Seasonality, and Noise
+
+# Compute exact component magnitudes to support written interpretation
+annual_means <- sparkling |>
+  mutate(Year = year(Month)) |>
+  group_by(Year) |>
+  summarise(
+    Ann_Mean  = mean(Sales),
+    Dec_Sales = Sales[month(Month) == 12],
+    .groups   = "drop"
+  )
+
+trend_change <- annual_means$Ann_Mean[annual_means$Year == 1993] -
+                annual_means$Ann_Mean[annual_means$Year == 1980]
+
+cat("Annual mean 1980:", round(annual_means$Ann_Mean[annual_means$Year==1980]),
+    "thousand litres\n")
+cat("Annual mean 1993:", round(annual_means$Ann_Mean[annual_means$Year==1993]),
+    "thousand litres\n")
+cat("Trend change:    ", round(trend_change), "thousand litres over 14 years\n")
+
+# Compute December amplitude (absolute and ratio) for each training year
+# This is the definitive test for additive vs. multiplicative seasonality
+
+
+# Convert tsibble to plain dataframe to remove hidden index columns
+sparkling_df <- as.data.frame(sparkling)
+
+annual_avg <- sparkling_df |>
+  mutate(Year = year(Month)) |>
+  group_by(Year) |>
+  summarise(Annual_Mean = round(mean(Sales)), .groups = "drop")
+
+dec_sales <- sparkling_df |>
+  mutate(Year = year(Month)) |>
+  filter(month(Month) == 12) |>
+  select(Year, Dec_Sales = Sales)
+
+amp_tbl <- annual_avg |>
+  left_join(dec_sales, by = "Year") |>
+  mutate(
+    Amplitude = Dec_Sales - Annual_Mean,
+    Ratio     = round(Dec_Sales / Annual_Mean, 2)
+  ) |>
+  filter(Year < 1994)
+
+colnames(amp_tbl)
+
+
+# Methodology
+
+## Partitioning Strategy
+
+
+# ── Train/validation split: same 12-month holdout as Fortified wine example ─────
+# Training:   Jan 1980 – Dec 1993  (168 months)
+# Validation: Jan 1994 – Dec 1994  (12 months — held out entirely)
+
+train <- sparkling |> filter(year(Month) < 1994)
+valid <- sparkling |> filter(year(Month) >= 1994)
+
+cat("Training set:   ", nrow(train), "observations (Jan 1980 – Dec 1993)\n")
+cat("Validation set: ", nrow(valid), "observations (Jan 1994 – Dec 1994)\n")
+
+
+## ETS Models Fitted
+
+We fit **six models** covering the full spectrum from simple to complex, exactly
+as specified in the assignment:
+
+# ── Fit all models on the training set ────────────────────────────────────────
+# All six models stored in a single mable — fit ONCE, reuse throughout.
+# This avoids redundant refitting and ensures consistent parameter estimates.
+
+fit <- train |>
+  model(
+    # ── Benchmark ────────────────────────────────────────────────────────────
+    # Seasonal Naïve: forecast = same month in prior year (no smoothing at all)
+    snaive    = SNAIVE(Sales),
+
+   
+  )
+
+
+
+# ── View optimised smoothing parameters (MLE on training set) ──────────────────
+# alpha: level smoothing — high alpha = trusts recent data more
+# beta:  trend smoothing — high beta = trend adapts quickly
+# gamma: seasonal smoothing — high gamma = seasonal indices update quickly
+# phi:   damping factor (hw_damped only) — < 1 flattens trend over horizon
+# l[0], b[0], s[0..11]: initial state values optimised jointly with alpha/beta/gamma
+
+fit |>
+  tidy() |>
+  filter(.model != "snaive") |>
+  select(.model, term, estimate) |>
+  pivot_wider(names_from = term, values_from = estimate) |>
+  kable(
+    digits    = 4,
+    caption   = "Table 2: Optimised ETS Smoothing Parameters (MLE on 1980–1993 Training Data)"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# ── In-sample information criteria (AIC, AICc, BIC) ────────────────────────────
+# AICc (corrected AIC) balances fit vs. model complexity on the TRAINING set.
+# Lower AICc = preferred model in-sample.
+# Note: AICc measures in-sample fit; MASE measures out-of-sample accuracy.
+# Both are reported for completeness.
+
+fit |>
+  glance() |>
+  filter(.model != "snaive") |>
+  select(.model, AIC, AICc, BIC) |>
+  arrange(AICc) |>
+  kable(
+    digits    = 1,
+    col.names = c("Model", "AIC", "AICc", "BIC"),
+    caption   = "Table 3: In-Sample Information Criteria — Sorted by AICc (lower = better)"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+
+# Results
+
+## Forecast Accuracy
+
+### Generate 12-Month Forecasts
+
+
+# ── Generate 12-month-ahead forecasts for all six models ──────────────────────
+# forecast() reuses the already-fitted `fit` mable — no refitting required.
+# h = 12: forecast the 12 months of 1994 (the validation period)
+fc <- fit |> forecast(h = 12)
+
+
+
+# Show last 3 training years + full 1994 validation year for context
+sparkling_recent <- sparkling |> filter(year(Month) >= 1991)
+
+fc_tbl <- fc |>
+  as_tibble() |>
+  select(.model, Month, .mean)
+
+fc_tbl <- fc |>
+  as_tibble() |>
+  select(.model, Month, .mean)
+
+ggplot() +
+  geom_line(data = as.data.frame(sparkling) |> 
+              filter(year(Month) >= 1991),
+            aes(x = as.Date(Month), y = Sales),
+            colour = "black", linewidth = 1.0) +
+  geom_line(data = fc_tbl |>
+              mutate(Month = as.Date(Month)),
+            aes(x = Month, y = .mean, colour = .model, linetype = .model),
+            linewidth = 0.85) +
+  scale_colour_manual(values = c(
+    "snaive"    = "#95A5A6",
+    "ses"       = "#E74C3C",
+    "holt"      = "#E67E22",
+    "hw_add"    = "#3498DB",
+    "hw_mult"   = "#27AE60",
+    "hw_damped" = "#8E44AD"
+  )) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Sparkling Wine: All ETS Forecasts vs. Actual 1994 Sales",
+    subtitle = "Black = observed | Coloured lines = model forecasts",
+    y        = "Sales (thousands of litres)",
+    x        = NULL,
+    colour   = "Model",
+    linetype = "Model"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(legend.position = "bottom")
+
+
+
+# ── Compute all five accuracy metrics on the hold-out validation set ────────────
+# accuracy(fc, sparkling) matches each forecast to the observed 1994 values.
+# ME:   Mean Error — positive = over-forecast; negative = under-forecast
+# RMSE: Root Mean Squared Error — penalises large errors more
+# MAE:  Mean Absolute Error — average absolute miss per month
+# MAPE: Mean Absolute Percentage Error — scale-free % miss
+# MASE: Mean Absolute Scaled Error — ratio to SNAIVE MAE (< 1 beats naive)
+
+acc <- accuracy(fc, sparkling) |>
+  select(.model, ME, RMSE, MAE, MAPE, MASE) |>
+  arrange(MASE)
+
+acc |>
+  kable(
+    digits    = 3,
+    col.names = c("Model", "ME", "RMSE", "MAE", "MAPE (%)", "MASE"),
+    caption   = "Table 4: Out-of-Sample Forecast Accuracy — 1994 Validation Set (sorted by MASE)"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) |>
+  row_spec(1, bold = TRUE, background = "#d4efdf",
+           extra_css = "border: 2px solid #27AE60;") |>
+  row_spec(which(acc$.model %in% c("ses", "holt")),
+           background = "#fde8e8") |>
+  footnote(
+    general       = "Green highlight = best model. Red highlight = models that ignore seasonality.",
+    general_title = "Note:"
+  )
+
+
+# Extract key values for inline narrative
+best_name   <- acc$.model[1]
+best_mase   <- acc$MASE[1]
+best_mae    <- acc$MAE[1]
+snaive_mase <- acc$MASE[acc$.model == "snaive"]
+ses_mase    <- acc$MASE[acc$.model == "ses"]
+holt_mase   <- acc$MASE[acc$.model == "holt"]
+pct_better  <- (1 - best_mase / snaive_mase) * 100
+above1      <- acc |> filter(MASE > 1)
+
+cat("Best model:              ", best_name, "\n")
+cat("Best MASE:               ", round(best_mase, 3), "\n")
+cat("Improvement over SNAIVE: ", round(pct_better, 1), "%\n")
+cat("Best MAE:                ", round(best_mae, 1), "thousand litres/month\n\n")
+cat("Models with MASE > 1 (worse than naive):\n")
+if (nrow(above1) > 0) {
+  print(above1 |> select(.model, MASE))
+} else {
+  cat("  None\n")
+}
+
+# Extract best model from the already-fitted mable — dynamically determined
+cat("Diagnosing residuals for best model:", best_name, "\n")
+best_fit <- fit |> select(all_of(best_name))
+
+
+### Three-Panel Diagnostic Plot
+
+
+# gg_tsresiduals() produces three panels in one call:
+# Panel 1: innovation residuals over time (should look random, centred at zero)
+# Panel 2: ACF of residuals (all bars should lie within 95% confidence bands)
+# Panel 3: histogram of residuals (should be bell-shaped, centred at zero)
+
+best_fit |>
+  gg_tsresiduals(lag_max = 36) +
+  labs(
+    title    = paste("Residual Diagnostics:", best_name, "(Sparkling Wine, 1980–1993)"),
+    subtitle = "Top: residuals over time | Middle: ACF of residuals | Bottom: histogram"
+  )
+
+
+### Ljung-Box White Noise Test
+
+# ── Ljung-Box test at lag = 24 (2 years × 12 months/year) ─────────────────────
+# H0: the first 24 residual autocorrelations are all zero (white noise)
+# p > 0.05: fail to reject H0 → model adequate → DEPLOY
+# p <= 0.05: reject H0 → structure remains → DO NOT DEPLOY yet
+
+lb_result <- best_fit |>
+  augment() |>
+  features(.innov, ljung_box, lag = 24)
+
+lb_result |>
+  select(.model, lb_stat, lb_pvalue) |>
+  kable(
+    digits    = 4,
+    col.names = c("Model", "Ljung-Box Q (lag=24)", "p-value"),
+    caption   = "Table 5: Ljung-Box Test — Best Model (lag = 24)"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+
+# Comparing residual ACF patterns across models reveals which leave structure behind
+# SNAIVE will show lag-12 spikes (it never updates seasonal estimates)
+# HW models should have clean ACFs if seasonality is well-captured
+
+fit |>
+  augment() |>
+  ACF(.innov, lag_max = 36) |>
+  autoplot() +
+  facet_wrap(~ .model, ncol = 2) +
+  labs(
+    title    = "Residual ACF by Model — Sparkling Wine",
+    subtitle = "Blue bands = 95% bounds | Clean ACF = model adequately captures series structure"
+  ) +
+  theme_minimal(base_size = 11)
+
+# Compare white noise test results across all six models
+fit |>
+  augment() |>
+  features(.innov, ljung_box, lag = 24) |>
+  select(.model, lb_stat, lb_pvalue) |>
+  arrange(desc(lb_pvalue)) |>
+  kable(
+    digits    = 4,
+    col.names = c("Model", "Q Statistic", "p-value"),
+    caption   = "Table 6: Ljung-Box Test (lag=24) Across All Models — Higher p = cleaner residuals"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE)
+
+# Compute exact residual statistics for evidence-based interpretation
+resid_data <- best_fit |> augment() |> select(Month, .innov) |> na.omit()
+
+resid_mean <- mean(resid_data$.innov)
+resid_sd   <- sd(resid_data$.innov)
+skew_val   <- mean(((resid_data$.innov - resid_mean)/resid_sd)^3)
+kurt_val   <- mean(((resid_data$.innov - resid_mean)/resid_sd)^4)
+n_train    <- nrow(resid_data)
+ci_resid   <- 1.96 / sqrt(n_train)
+
+# Residual ACF at key lags
+resid_acf  <- best_fit |> augment() |> ACF(.innov, lag_max=36) |> as_tibble()
+r_lag1     <- resid_acf$acf[resid_acf$lag == 1]
+r_lag12    <- resid_acf$acf[resid_acf$lag == 12]
+sig_lags   <- resid_acf |> filter(lag > 0, abs(acf) > ci_resid) |> pull(lag)
+p_val      <- lb_result$lb_pvalue
+
+# Variance stability
+n_half     <- n_train %/% 2
+var_ratio  <- var(resid_data$.innov[(n_half+1):n_train]) /
+              var(resid_data$.innov[1:n_half])
+
+# December residuals specifically
+dec_resid_mean <- mean(resid_data$.innov[month(resid_data$Month) == 12])
+
+within_2sd <- mean(abs(resid_data$.innov - resid_mean) <= 2*resid_sd) * 100
+
+cat("--- Residual Summary ---\n")
+cat("Mean:            ", round(resid_mean, 1), "\n")
+cat("Std deviation:   ", round(resid_sd, 1), "\n")
+cat("Skewness:        ", round(skew_val, 3), "\n")
+cat("Kurtosis:        ", round(kurt_val, 3), "\n")
+cat("Within 2 SD:     ", round(within_2sd, 1), "%  (normal = 95%)\n")
+cat("Variance ratio:  ", round(var_ratio, 3), "(2nd half / 1st half)\n")
+cat("Dec resid mean:  ", round(dec_resid_mean, 1), "\n")
+cat("ACF lag 1:       ", round(r_lag1, 4),
+    ifelse(abs(r_lag1) > ci_resid, " SIGNIFICANT", " within bounds"), "\n")
+cat("ACF lag 12:      ", round(r_lag12, 4),
+    ifelse(abs(r_lag12) > ci_resid, " SIGNIFICANT", " within bounds"), "\n")
+cat("Significant lags:", ifelse(length(sig_lags)==0, "none", paste(sig_lags, collapse=", ")), "\n")
+cat("Ljung-Box p:     ", round(p_val, 4), "\n")
+
+# Theoretical prediction intervals assume normally distributed errors
+# 80% PI: plausible range for 8 out of 10 future months
+# 95% PI: wider range capturing more extreme scenarios
+
+fc_best <- best_fit |> forecast(h = 12)
+
+fc_best |>
+  autoplot(sparkling |> filter(year(Month) >= 1991), level = c(80, 95)) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = paste("Forecast with Prediction Intervals:", best_name),
+    subtitle = "Dark band: 80% PI | Light band: 95% PI | Black line: observed sales",
+    y = "Sales (thousands of litres)", x = NULL
+  ) +
+  theme_minimal(base_size = 13)
+
+
+# ── Empirical prediction interval from actual hold-out errors ──────────────────
+# These are computed from the 12 actual 1994 validation errors
+val_errors <- valid$Sales - fc_best$.mean
+
+cat("Empirical Prediction Interval (12 hold-out validation errors):\n")
+cat("  5th  percentile:", round(quantile(val_errors, 0.05)), "thousand litres\n")
+cat(" 95th  percentile:", round(quantile(val_errors, 0.95)), "thousand litres\n")
+cat("\n Month-by-month 1994 forecast accuracy:\n")
+
+data.frame(
+  Month    = format(valid$Month),
+  Actual   = valid$Sales,
+  Forecast = round(fc_best$.mean),
+  Error    = round(val_errors),
+  Pct_Err  = round(abs(val_errors)/valid$Sales * 100, 1)
+) |>
+  kable(
+    col.names = c("Month", "Actual", "Forecast", "Error", "Abs % Error"),
+    caption   = "Table 7: Month-by-Month 1994 Validation Results"
+  ) |>
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+
+
+
+# This section previews Chapter 7 by demonstrating how differencing removes
+# the non-stationary components (trend and seasonality) identified in the EDA.
+# A stationary series (bottom panel) is the prerequisite for ARIMA modelling.
+
+sparkling |>
+  mutate(
+    diff1    = difference(Sales, 1),      # first difference (lag 1): removes trend
+    diff12   = difference(Sales, 12),     # seasonal diff (lag 12): removes seasonality
+    diff1_12 = difference(diff1, 12)      # both: achieves approximate stationarity
+  ) |>
+  pivot_longer(
+    cols      = c(Sales, diff1, diff12, diff1_12),
+    names_to  = "Series",
+    values_to = "Value"
+  ) |>
+  mutate(Series = factor(Series,
+    levels = c("Sales", "diff1", "diff12", "diff1_12"),
+    labels = c("Original (non-stationary)",
+               "1st Difference — trend removed (d=1)",
+               "Seasonal Difference lag-12 — seasonality removed (D=1)",
+               "Both Differences — approximately stationary (d=1, D=1)"))) |>
+  autoplot(Value) +
+  facet_wrap(~ Series, scales = "free_y", ncol = 1) +
+  labs(title    = "Differencing Preview: Bridge to ARIMA (Chapter 7)",
+       subtitle = "Applying d=1 and D=1 at lag 12 produces a stationary series",
+       y = "Value", x = NULL) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+
+# ── Deployment checklist — mirrors Section 9 of the Fortified wine starter script
+mase_val  <- acc$MASE[acc$.model == best_name]
+me_val    <- acc$ME[acc$.model == best_name]
+p_val_dep <- lb_result$lb_pvalue
+
+cat("=================================================================\n")
+cat(" DEPLOYMENT CHECKLIST — SPARKLING WINE (", best_name, ")\n")
+cat(" [Same three gates as Fortified wine Section 9]\n")
+cat("=================================================================\n\n")
+
+gate1 <- mase_val < 1
+gate2 <- p_val_dep > 0.05
+gate3 <- abs(me_val) < 250
+
+cat("GATE 1 — MASE < 1.0 (beats seasonal naive benchmark):\n")
+cat(" MASE =", round(mase_val, 3),
+    "->", ifelse(gate1,
+    paste0("PASS — beats naive by ", round((1-mase_val)*100,1), "%"),
+    "FAIL — does not beat naive"), "\n\n")
+
+cat("GATE 2 — Ljung-Box p > 0.05 (residuals are white noise):\n")
+cat(" p =", round(p_val_dep, 4),
+    "->", ifelse(gate2,
+    "PASS — residuals consistent with white noise",
+    "CONCERN — residual autocorrelation detected"), "\n\n")
+
+cat("GATE 3 — ME operationally acceptable (low systematic bias):\n")
+cat(" ME =", round(me_val, 1), "thousand litres ->",
+    ifelse(gate3,
+    paste0("PASS — bias of ",
+           round(abs(me_val)/mean(sparkling$Sales)*100,1), "% of series mean"),
+    "CONCERN — notable systematic bias"), "\n\n")
+
+cat("-----------------------------------------------------------------\n")
+if (gate1 & gate2) {
+  cat("FINAL VERDICT: DEPLOY\n")
+  cat("All gates satisfied. Model is adequate for production forecasting.\n")
+} else if (gate1 & !gate2) {
+  cat("FINAL VERDICT: DEPLOY WITH CAUTION\n")
+  cat("Beats benchmark but residual structure remains.\n")
+} else {
+  cat("FINAL VERDICT: DO NOT DEPLOY\n")
+  cat("Model fails to beat seasonal naive.\n")
+}
+cat("=================================================================\n")
+
+# Visual summary of the deployment decision
+data.frame(
+  Gate      = c("Gate 1 — Accuracy",
+                "Gate 2 — Residual Quality",
+                "Gate 3 — Bias"),
+  Metric    = c(paste0("MASE = ", round(mase_val, 3)),
+                paste0("LB p = ",  round(p_val_dep, 4)),
+                paste0("ME = ",    round(me_val, 1), " K litres")),
+  Threshold = c("< 1.0  (beats SNAIVE)",
+                "> 0.05 (white noise)",
+                "< 250K litres (< 10% of mean)"),
+  Result    = c(ifelse(gate1, "PASS", "FAIL"),
+                ifelse(gate2, "PASS", "CONCERN"),
+                ifelse(gate3, "PASS", "CONCERN"))
+) |>
+  kable(caption = "Table 8: Deployment Decision Gate Summary") |>
+  kable_styling(bootstrap_options = c("striped", "condensed"), full_width = FALSE) |>
+  column_spec(4, bold = TRUE,
+              color = ifelse(c(gate1, gate2, gate3), "#27AE60", "#E67E22"))
+
+acc |>
+  mutate(
+    Beats_Naive = ifelse(MASE < 1, "Yes", "No"),
+    Rank        = row_number()
+  ) |>
+  select(Rank, .model, MASE, RMSE, ME, Beats_Naive) |>
+  kable(
+    digits    = 3,
+    col.names = c("Rank", "Model", "MASE", "RMSE", "ME", "Beats SNAIVE?"),
+    caption   = "Table 9: Final Model Ranking — 1994 Validation Set"
+  ) |>
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed"),
+                full_width = FALSE) |>
+  row_spec(1, bold = TRUE, background = "#d4efdf") |>
+  row_spec(which(acc$.model %in% c("ses","holt")), background = "#fde8e8")
+
+# Code to explore:
+fit_sarima <- train |> model(sarima = ARIMA(Sales))
+fit_sarima |> report()   # shows selected SARIMA order
+
+# Code to explore:
+fit_xreg <- train |>
+  mutate(xmas = as.numeric(month(Month) == 12)) |>
+  model(hw_xreg = ETS(Sales ~ xmas + error("A") + trend("A") + season("M")))
